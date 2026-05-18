@@ -3,6 +3,30 @@
 ## [0.14.0](https://github.com/ArcReel/ArcReel/compare/v0.13.0...v0.14.0) (2026-05-18)
 
 
+### ⚠️ 升级须知（Breaking）
+
+本版本默认启用 **Agent Bash 沙箱**（[#521](https://github.com/ArcReel/ArcReel/issues/521)），server 启动期会强制探测；缺依赖或宿主内核策略禁用 user namespace 时会以 `SANDBOX_UNAVAILABLE` / `SANDBOX_BWRAP_BROKEN` 启动失败，启动日志会直接打印对应修复命令。
+
+**Docker 部署需要在 compose 放开沙箱所需的权限**：
+
+```yaml
+security_opt:
+  - seccomp:unconfined
+  - apparmor:unconfined
+cap_add:
+  - NET_ADMIN
+```
+
+Ubuntu 24.04+ 宿主还需在**宿主机**（不是容器内）关一次 AppArmor user namespace 限制：
+
+```bash
+sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+echo "kernel.apparmor_restrict_unprivileged_userns=0" | sudo tee /etc/sysctl.d/60-arcreel-bwrap.conf
+```
+
+macOS 沿用系统 `sandbox-exec` 无需改动；Windows 原生自动降级到 Bash 命令白名单。
+
+
 ### ✨ 新功能
 
 * **agent:** Agent 支持配置多供应商 + 预设默认供应商 ([#507](https://github.com/ArcReel/ArcReel/issues/507)) ([5e94cc2](https://github.com/ArcReel/ArcReel/commit/5e94cc2c121e9846765de1a10a1abd11a7f0ac73))
