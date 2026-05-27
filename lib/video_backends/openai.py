@@ -17,8 +17,7 @@ from lib.video_backends.base import (
     VideoCapability,
     VideoGenerationRequest,
     VideoGenerationResult,
-    get_resume_job_id,
-    persist_job_id_if_in_task_context,
+    persist_provider_job_id,
     poll_with_retry,
 )
 
@@ -98,12 +97,6 @@ class OpenAIVideoBackend:
         return VideoCapabilities(reference_images=True, max_reference_images=3)
 
     async def generate(self, request: VideoGenerationRequest) -> VideoGenerationResult:
-        # 重启自愈：worker _process_resume_task 入口 set _RESUME_JOB_ID 时跳 submit
-        # 直接 resume_video，避免重复扣费（ADR 0007）。
-        resume_id = get_resume_job_id()
-        if resume_id is not None:
-            return await self.resume_video(resume_id, request)
-
         kwargs: dict = {
             "prompt": request.prompt,
             "model": self._model,
@@ -130,9 +123,16 @@ class OpenAIVideoBackend:
         logger.info("调用 %s 视频 SDK kwargs=%s", self.name, format_kwargs_for_log(kwargs))
 
         video = await self._create_video(**kwargs)
-        # submit 成功立即持久化 job_id；持久化失败抛 → finally mark_failed（ADR 0007）
-        await persist_job_id_if_in_task_context(video.id)
+        # submit 成功立即持久化 job_id；持久化失败抛 → finally mark_failed。
+        # 非 worker 路径（grid / 直生 / 测试）request.task_id 为 None，跳过持久化。
+        if request.task_id is not None:
+            await persist_provider_job_id(request.task_id, video.id, provider=PROVIDER_OPENAI)
         final = await self._poll_until_complete(video.id, request.duration_seconds)
+
+        # generate 路径下 expired 是「provider 异常 / 输入参数过期」类失败，
+        # 抛 RuntimeError 让 worker mark_failed（不带 [resume_expired] 前缀）。
+        if final.status == "expired":
+            raise RuntimeError(f"OpenAI Sora job expired during generate: {final.id}")
 
         return await self._download_and_build_result(final, request, kwargs)
 
@@ -144,6 +144,16 @@ class OpenAIVideoBackend:
             if _is_openai_not_found(exc):
                 raise ResumeExpiredError(job_id=job_id, provider=PROVIDER_OPENAI) from exc
             raise
+
+        # resume 路径下 expired = provider 端已忘 / 输入资产过期，归类
+        # [resume_expired] 让 worker 错误前缀化、不再尝试重启自愈
+        if final.status == "expired":
+            raise ResumeExpiredError(
+                job_id=job_id,
+                provider=PROVIDER_OPENAI,
+                message=f"OpenAI Sora job expired: {final.id}",
+            )
+
         return await self._download_and_build_result(final, request, {"seconds": str(request.duration_seconds)})
 
     async def _download_and_build_result(
@@ -182,9 +192,15 @@ class OpenAIVideoBackend:
         """
         max_wait = max(_MIN_POLL_TIMEOUT_SECONDS, float(duration_seconds) * _POLL_TIMEOUT_PER_SECOND)
 
+        # _is_done 是纯谓词：completed / failed / expired 三种状态都视为「已终态」让 poll 返回。
+        # caller (generate / resume_video) 拿到 result 后再分流：
+        #   - completed → 下载
+        #   - failed   → is_failed 已抛 RuntimeError
+        #   - expired  → 在 caller 处按 generate vs resume 上下文抛 RuntimeError / ResumeExpiredError
+        # 关键不变量：is_failed 不识别 expired，避免覆盖 caller 分流。
         return await poll_with_retry(
             poll_fn=lambda: self._client.videos.retrieve(video_id),
-            is_done=lambda v: v.status == "completed",
+            is_done=lambda v: v.status in ("completed", "failed", "expired"),
             is_failed=lambda v: f"Sora 视频生成失败: {getattr(v, 'error', None)}" if v.status == "failed" else None,
             poll_interval=_POLL_INTERVAL_SECONDS,
             max_wait=max_wait,
@@ -211,7 +227,12 @@ def _encode_start_image(image_path: Path) -> tuple[str, bytes, str]:
 
 
 def _is_openai_not_found(exc: BaseException) -> bool:
-    """识别 OpenAI/Sora 「job 不存在 / 已过期」响应（NotFoundError、HTTP 404、status=expired）。"""
+    """识别 OpenAI/Sora 「job 不存在」响应（NotFoundError / HTTP 404）。
+
+    不再做 ``"not found"`` / ``"expired"`` 子串兜底：``status='expired'`` 已在
+    ``_poll_until_complete`` 内直接抛 ``ResumeExpiredError`` 处理（fix #5），
+    宽泛字串会把诸如 ``"file not found in storage"`` 等业务错误误判为幽灵任务。
+    """
     try:
         from openai import NotFoundError  # pyright: ignore[reportMissingImports]
     except ImportError:
@@ -220,7 +241,4 @@ def _is_openai_not_found(exc: BaseException) -> bool:
     if NotFoundError is not None and isinstance(exc, NotFoundError):
         return True
     status_code = getattr(exc, "status_code", None) or getattr(getattr(exc, "response", None), "status_code", None)
-    if status_code == 404:
-        return True
-    msg = str(exc).lower()
-    return "not found" in msg or "expired" in msg
+    return status_code == 404

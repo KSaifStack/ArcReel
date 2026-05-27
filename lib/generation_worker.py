@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any
@@ -17,6 +18,11 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 from datetime import UTC
+
+# Lease 丢失超过 ``lease_ttl * _ORPHAN_RESCAN_LEASE_LOST_MULT`` 才认为是真切换 owner
+# （另一个 worker 进程曾持过 lease 且写入了新 orphan），需要重扫；短 flap（续约抖动）
+# 不触发。lease_ttl 默认 10s → 阈值 30s。常量化便于单测注入与未来调参。
+_ORPHAN_RESCAN_LEASE_LOST_MULT = 3
 
 from lib.generation_queue import (
     TASK_POLL_INTERVAL_SEC,
@@ -59,19 +65,27 @@ def _read_int_env(name: str, default: int, minimum: int = 1) -> int:
 
 @dataclass
 class ProviderPool:
-    """Per-provider concurrency pool with independent image/video lanes."""
+    """Per-provider concurrency pool with independent image/video lanes.
+
+    Video lane 还有一个 ``video_pending`` 字典：dispatcher 父协程 ``create_task`` 后
+    sub-task 还在 sem 排队的瞬态。``has_video_room`` 计入 pending + inflight 严格
+    限制总并发；``request_cancel`` 也查 pending，让排队中的孤儿可被秒级取消。
+    Image lane 不引入 ``image_pending``——image 没有 sem-throttled dispatcher。
+    """
 
     provider_id: str
     image_max: int  # 0 = this provider doesn't support image
     video_max: int  # 0 = this provider doesn't support video
     image_inflight: dict[str, asyncio.Task] = field(default_factory=dict)
     video_inflight: dict[str, asyncio.Task] = field(default_factory=dict)
+    video_pending: dict[str, asyncio.Task] = field(default_factory=dict)
 
     def has_image_room(self) -> bool:
         return self.image_max > 0 and len(self.image_inflight) < self.image_max
 
     def has_video_room(self) -> bool:
-        return self.video_max > 0 and len(self.video_inflight) < self.video_max
+        # 计入 pending：sem 排队期 sub-task 同样占名额，避免主循环超额 claim
+        return self.video_max > 0 and len(self.video_inflight) + len(self.video_pending) < self.video_max
 
     def drain_finished(self) -> list[asyncio.Task]:
         """Remove finished tasks from inflight dicts. Return them for await."""
@@ -83,7 +97,12 @@ class ProviderPool:
         return finished
 
     def all_inflight(self) -> list[asyncio.Task]:
+        """实际在跑的 task（不含 sem 排队中的 pending）。用于 metrics/真实并发统计。"""
         return [*self.image_inflight.values(), *self.video_inflight.values()]
+
+    def all_active(self) -> list[asyncio.Task]:
+        """In-flight + 排队中的 pending：用于 reload keep-alive 判定 / shutdown wait。"""
+        return [*self.image_inflight.values(), *self.video_inflight.values(), *self.video_pending.values()]
 
 
 async def _extract_provider(task: dict[str, Any]) -> str:
@@ -215,6 +234,13 @@ class GenerationWorker:
         self._main_task: asyncio.Task | None = None
         self._stop_event = asyncio.Event()
         self._owns_lease = False
+        # Orphan dispatcher 句柄持久化：shutdown 时 await 它跑完；lease 切换重夺时
+        # 第二次进 _handle_orphan_tasks_on_start，旧句柄未 done 不能直接覆盖。
+        self._orphan_dispatcher_task: asyncio.Task | None = None
+        # 一次性扫描开关：单 lease 互斥架构下，进程一旦扫过 orphan 就不再重扫；
+        # 配合 _lease_lost_monotonic 阈值在「真切换 owner」时清零、「短 flap」不清零。
+        self._orphan_handled_once: bool = False
+        self._lease_lost_monotonic: float | None = None
 
     # ------------------------------------------------------------------
     # Backward compatibility shims
@@ -288,17 +314,20 @@ class GenerationWorker:
             logger.warning("从 DB 加载供应商配置失败，保持当前配置", exc_info=True)
             return
 
-        # Migrate inflight tasks to new pool objects
+        # Migrate inflight + pending tasks to new pool objects；漏迁 video_pending
+        # 会让 sem 排队中的 sub-task 引用旧 pool 字典，新 pool 看不见，cancel 失配
+        # 且 keep-alive 判定漏掉这些 task。
         for pid, new_pool in new_pools.items():
             old_pool = self._pools.get(pid)
             if old_pool:
                 new_pool.image_inflight = old_pool.image_inflight
                 new_pool.video_inflight = old_pool.video_inflight
+                new_pool.video_pending = old_pool.video_pending
 
         # Pools that existed before but are no longer registered:
-        # keep them alive until their inflight tasks drain
+        # 仍有 pending / inflight 的旧 pool 保留到耗尽——用 all_active 判定（含 pending）。
         for pid, old_pool in self._pools.items():
-            if pid not in new_pools and old_pool.all_inflight():
+            if pid not in new_pools and old_pool.all_active():
                 new_pools[pid] = old_pool
                 new_pools[pid].image_max = 0
                 new_pools[pid].video_max = 0
@@ -364,12 +393,27 @@ class GenerationWorker:
 
                 await self._drain_finished_tasks()
 
-                # 仅在「真重启 / 长时间失去 lease 后重获」时扫一次孤儿做重启自愈：
-                # 同 ADR 0007——重启不重 submit；按 provider_job_id 接续轮询或标 failed。
-                # 保留 guard 否则 lease 续期会重复扫孤儿。
-                all_inflight = self._image_inflight or self._video_inflight
-                if self._owns_lease and not had_lease and not all_inflight:
+                # Lease 状态变化跟踪：首次失去 lease 时打点；重夺 lease 后判断
+                # 「真切换 owner」（>= 3× ttl）→ 重置开关；「续约 flap」（< 3× ttl）→ 保持。
+                if had_lease and not self._owns_lease and self._lease_lost_monotonic is None:
+                    self._lease_lost_monotonic = time.monotonic()
+                if self._owns_lease and self._lease_lost_monotonic is not None:
+                    lost_duration = time.monotonic() - self._lease_lost_monotonic
+                    if lost_duration > self.lease_ttl * _ORPHAN_RESCAN_LEASE_LOST_MULT:
+                        logger.info(
+                            "lease 丢失 %.1fs（> %d×ttl=%.1fs），认为另一进程曾持过 lease，重扫 orphan",
+                            lost_duration,
+                            _ORPHAN_RESCAN_LEASE_LOST_MULT,
+                            self.lease_ttl * _ORPHAN_RESCAN_LEASE_LOST_MULT,
+                        )
+                        self._orphan_handled_once = False
+                    self._lease_lost_monotonic = None
+
+                # 一次性扫描：进程持 lease 后只扫一次 orphan；后续主循环不再重扫。
+                # 单 lease 互斥保证不会与另一个 worker 同时扫；跨进程接管由上述阈值兜底。
+                if self._owns_lease and not self._orphan_handled_once:
                     await self._handle_orphan_tasks_on_start()
+                    self._orphan_handled_once = True
 
                 if not self._owns_lease:
                     await asyncio.sleep(self.heartbeat_interval)
@@ -520,15 +564,24 @@ class GenerationWorker:
                     logger.debug("已处理的任务异常已在 _process_task 中记录")
 
     async def _wait_inflight_completion(self) -> None:
-        pending_tasks = []
+        # shutdown：先等 dispatcher 派完最后一批 sub-task（否则 sub-task 可能在 dispatcher
+        # 退出后才创建），再等所有 active task。dispatcher 异常不能断 shutdown 链。
+        if self._orphan_dispatcher_task is not None and not self._orphan_dispatcher_task.done():
+            try:
+                await self._orphan_dispatcher_task
+            except Exception:
+                logger.exception("orphan dispatcher 在 shutdown 等待时异常")
+
+        active_tasks = []
         for pool in self._pools.values():
-            pending_tasks.extend(pool.all_inflight())
-        if not pending_tasks:
+            active_tasks.extend(pool.all_active())
+        if not active_tasks:
             return
-        await asyncio.gather(*pending_tasks, return_exceptions=True)
+        await asyncio.gather(*active_tasks, return_exceptions=True)
         for pool in self._pools.values():
             pool.image_inflight.clear()
             pool.video_inflight.clear()
+            pool.video_pending.clear()
 
     async def _process_task(self, task: dict[str, Any]) -> None:
         """Run a generation task with 0-rows-cancelled finally protocol (ADR 0006).
@@ -542,59 +595,62 @@ class GenerationWorker:
         provider_id = await _extract_provider(task)
         logger.info("开始处理任务 %s (type=%s, provider=%s)", task_id, task_type, provider_id)
 
-        from lib.video_backends.base import reset_current_task_id, set_current_task_id
+        from server.services.generation_tasks import execute_generation_task
 
-        token = set_current_task_id(task_id)
         try:
-            from server.services.generation_tasks import execute_generation_task
-
-            try:
-                result = await execute_generation_task(task)
-            except asyncio.CancelledError:
-                # 用户/级联取消：worker.request_cancel 触发 asyncio.Task.cancel()
-                await asyncio.shield(self.queue.mark_task_cancelled(task_id, cancelled_by="user"))
-                raise
-            except Exception as exc:
-                logger.exception("任务失败 %s (type=%s, provider=%s)", task_id, task_type, provider_id)
-                rows = await asyncio.shield(self.queue.mark_task_failed(task_id, str(exc)))
-                if rows == 0:
-                    # 外部已抢先翻 cancelling → 落地 cancelled 终态
-                    await asyncio.shield(self.queue.mark_task_cancelled(task_id, cancelled_by="user"))
-                return
-
-            try:
-                rows = await asyncio.shield(self.queue.mark_task_succeeded(task_id, result))
-            except asyncio.CancelledError:
-                # mark_succeeded 期间被取消：shield 让 inner 跑完了；inner 完成情况由
-                # rowcount 决定——拿不到了，按"被外部取消"语义兜底。
-                await asyncio.shield(self.queue.mark_task_cancelled(task_id, cancelled_by="user"))
-                raise
+            result = await execute_generation_task(task)
+        except asyncio.CancelledError:
+            # 用户/级联取消：worker.request_cancel 触发 asyncio.Task.cancel()
+            await asyncio.shield(self.queue.mark_task_cancelled(task_id, cancelled_by="user"))
+            raise
+        except Exception as exc:
+            logger.exception("任务失败 %s (type=%s, provider=%s)", task_id, task_type, provider_id)
+            rows = await asyncio.shield(self.queue.mark_task_failed(task_id, str(exc)))
             if rows == 0:
-                # 0-rows-cancelled 协议：execute 跑赢但 DB 已被外部翻 cancelling
+                # 外部已抢先翻 cancelling → 落地 cancelled 终态
                 await asyncio.shield(self.queue.mark_task_cancelled(task_id, cancelled_by="user"))
-            else:
-                logger.info("任务完成 %s (type=%s, provider=%s)", task_id, task_type, provider_id)
-        finally:
-            reset_current_task_id(token)
+            return
+
+        try:
+            rows = await asyncio.shield(self.queue.mark_task_succeeded(task_id, result))
+        except asyncio.CancelledError:
+            # mark_succeeded 期间被取消：shield 让 inner 跑完了；inner 完成情况由
+            # rowcount 决定——拿不到了，按"被外部取消"语义兜底。
+            await asyncio.shield(self.queue.mark_task_cancelled(task_id, cancelled_by="user"))
+            raise
+        except Exception:
+            # mark_succeeded 自身抛错（DB 超时 / OperationalError）：上层 _drain_finished_tasks
+            # 只吞掉异常 debug 日志，stack trace 会丢失，因此在这里显式 logger.exception 保留现场。
+            logger.exception("标记任务成功失败 %s", task_id)
+            raise
+        if rows == 0:
+            # 0-rows-cancelled 协议：execute 跑赢但 DB 已被外部翻 cancelling
+            await asyncio.shield(self.queue.mark_task_cancelled(task_id, cancelled_by="user"))
+        else:
+            logger.info("任务完成 %s (type=%s, provider=%s)", task_id, task_type, provider_id)
 
     async def _process_resume_task(self, task: dict[str, Any]) -> None:
-        """重启自愈入口：set _RESUME_JOB_ID + _CURRENT_TASK_ID 后调 execute_generation_task。
-
-        与 ``_process_task`` 共用 finally 协议；backend.generate 内部检测 _RESUME_JOB_ID
-        会跳过 submit 直接走 resume_video 接续轮询（ADR 0007）。
+        """重启自愈入口：直接调 backend.resume_video，绕过 normal executor 流水线。
 
         provider 锁定：把持久化的 ``task["provider_id"]`` 注入 payload 的
-        ``video_provider`` / ``image_provider``，让 ``ConfigResolver`` 按持久化 provider
-        而非当前项目配置解析 backend。否则任务提交后到重启前若项目 provider 配置切换，
+        ``video_provider`` 字段，让 ``ConfigResolver`` 按持久化 provider 而非当前
+        项目配置解析 backend。否则任务提交后到重启前若项目 provider 配置切换，
         会拿旧 ``provider_job_id`` 去新 provider 轮询，导致可恢复任务被误判失败。
         """
         task_id = task["task_id"]
         task_type = task.get("task_type", "unknown")
 
+        job_id = task.get("provider_job_id") or ""
+        if not job_id:
+            # 防御：本不该被派发到这里（_handle_orphan_tasks_on_start 已 mark_failed [restart_lost]）
+            rows = await asyncio.shield(
+                self.queue.mark_task_failed(task_id, "[restart_lost] 无 provider_job_id 但被派发到 resume")
+            )
+            if rows == 0:
+                await asyncio.shield(self.queue.mark_task_cancelled(task_id, cancelled_by="user"))
+            return
+
         # 锁定持久化 provider 到 payload（resolver 优先级：payload > project > 默认）。
-        # _trusted_payload_provider 会拒绝不在 registry/custom 里的值，不可信时 resolver
-        # 回退默认，resume_video 大概率拿不到匹配的 job_id → 走 [resume_expired]，
-        # 比静默漂移好。
         persisted_provider_id = task.get("provider_id")
         if persisted_provider_id:
             payload = task.get("payload")
@@ -608,7 +664,6 @@ class GenerationWorker:
                 payload["image_provider"] = persisted_provider_id
 
         provider_id = await _extract_provider(task)
-        job_id = task.get("provider_job_id") or ""
         logger.info(
             "重启自愈处理任务 %s (type=%s, provider=%s, job=%s)",
             task_id,
@@ -617,55 +672,42 @@ class GenerationWorker:
             job_id,
         )
 
-        from lib.video_backends.base import (
-            ResumeExpiredError,
-            reset_current_task_id,
-            reset_resume_job_id,
-            set_current_task_id,
-            set_resume_job_id,
-        )
+        from lib.video_backends.base import ResumeExpiredError
+        from server.services.resume_executor import execute_resume_video_task
 
-        token_task = set_current_task_id(task_id)
-        token_resume = set_resume_job_id(job_id)
         try:
-            from server.services.generation_tasks import execute_generation_task
-
-            try:
-                result = await execute_generation_task(task)
-            except asyncio.CancelledError:
-                await asyncio.shield(self.queue.mark_task_cancelled(task_id, cancelled_by="user"))
-                raise
-            except NotImplementedError as exc:
-                logger.warning("resume 不支持 task %s: %s", task_id, exc)
-                rows = await asyncio.shield(self.queue.mark_task_failed(task_id, f"[resume_unsupported] {exc}"))
-                if rows == 0:
-                    await asyncio.shield(self.queue.mark_task_cancelled(task_id, cancelled_by="user"))
-                return
-            except ResumeExpiredError as exc:
-                logger.warning("resume 已过期 task %s: %s", task_id, exc)
-                rows = await asyncio.shield(self.queue.mark_task_failed(task_id, f"[resume_expired] {exc}"))
-                if rows == 0:
-                    await asyncio.shield(self.queue.mark_task_cancelled(task_id, cancelled_by="user"))
-                return
-            except Exception as exc:
-                logger.exception("resume 失败 %s (type=%s, provider=%s)", task_id, task_type, provider_id)
-                rows = await asyncio.shield(self.queue.mark_task_failed(task_id, str(exc)))
-                if rows == 0:
-                    await asyncio.shield(self.queue.mark_task_cancelled(task_id, cancelled_by="user"))
-                return
-
-            try:
-                rows = await asyncio.shield(self.queue.mark_task_succeeded(task_id, result))
-            except asyncio.CancelledError:
-                await asyncio.shield(self.queue.mark_task_cancelled(task_id, cancelled_by="user"))
-                raise
+            result = await execute_resume_video_task(task, job_id=job_id)
+        except asyncio.CancelledError:
+            await asyncio.shield(self.queue.mark_task_cancelled(task_id, cancelled_by="user"))
+            raise
+        except NotImplementedError as exc:
+            logger.warning("resume 不支持 task %s: %s", task_id, exc)
+            rows = await asyncio.shield(self.queue.mark_task_failed(task_id, f"[resume_unsupported] {exc}"))
             if rows == 0:
                 await asyncio.shield(self.queue.mark_task_cancelled(task_id, cancelled_by="user"))
-            else:
-                logger.info("重启自愈完成 %s", task_id)
-        finally:
-            reset_resume_job_id(token_resume)
-            reset_current_task_id(token_task)
+            return
+        except ResumeExpiredError as exc:
+            logger.warning("resume 已过期 task %s: %s", task_id, exc)
+            rows = await asyncio.shield(self.queue.mark_task_failed(task_id, f"[resume_expired] {exc}"))
+            if rows == 0:
+                await asyncio.shield(self.queue.mark_task_cancelled(task_id, cancelled_by="user"))
+            return
+        except Exception as exc:
+            logger.exception("resume 失败 %s (type=%s, provider=%s)", task_id, task_type, provider_id)
+            rows = await asyncio.shield(self.queue.mark_task_failed(task_id, str(exc)))
+            if rows == 0:
+                await asyncio.shield(self.queue.mark_task_cancelled(task_id, cancelled_by="user"))
+            return
+
+        try:
+            rows = await asyncio.shield(self.queue.mark_task_succeeded(task_id, result))
+        except asyncio.CancelledError:
+            await asyncio.shield(self.queue.mark_task_cancelled(task_id, cancelled_by="user"))
+            raise
+        if rows == 0:
+            await asyncio.shield(self.queue.mark_task_cancelled(task_id, cancelled_by="user"))
+        else:
+            logger.info("重启自愈完成 %s", task_id)
 
     # ------------------------------------------------------------------
     # Cancel & orphan recovery
@@ -674,12 +716,13 @@ class GenerationWorker:
     def request_cancel(self, task_id: str) -> bool:
         """In-process cancel 信号：把 task 对应 asyncio.Task cancel()，返回是否找到。
 
-        由 GenerationQueue.cancel_task 同步调用（ADR 0006 秒级响应）。callback 不命中
-        （task 已 finally 阶段 pop）是 best-effort 失败——DB 已是 cancelling，
-        worker finally 走 mark_cancelled 兜底（SQL 守卫 IN queued|cancelling 接住）。
+        由 GenerationQueue.cancel_task 同步调用（ADR 0006 秒级响应）。也查 video_pending：
+        sem 排队中的 sub-task cancel 会让 sem.acquire 抛 CancelledError 让 sub-task
+        直接退出。callback 不命中是 best-effort 失败——worker finally 走 mark_cancelled
+        兜底（SQL 守卫 IN queued|cancelling|running 接住）。
         """
         for pool in self._pools.values():
-            for inflight in (pool.image_inflight, pool.video_inflight):
+            for inflight in (pool.image_inflight, pool.video_inflight, pool.video_pending):
                 t = inflight.get(task_id)
                 if t is not None and not t.done():
                     t.cancel()
@@ -701,10 +744,13 @@ class GenerationWorker:
           → [resume_unsupported]（backend 不实现 resume_video，原 job 无接续手段）
         - video running，可 resume backend (ark/gemini/openai/newapi)：
           - 无 provider_job_id → [restart_lost]
-          - 有 job_id → 派发 _process_resume_task，由 backend.resume_video 决定后续走向
+          - 有 job_id → 收集到 `resumable_by_provider` 桶，后台 dispatcher 受
+            pool video_max 容量约束分批 dispatch（fix #647 第 1 项）
 
-        resume 阶段绕过 pool has_room 校验：把 resume task 一次性插入 pool inflight 字典，
-        期间 _claim_tasks 不接新 queued 任务（has_video_room() 返回 False）。
+        启动期 fast path（本函数）**只做终结类处理**，立刻返回；可 resume 的视频孤儿
+        派发给后台 dispatcher 处理，避免 N 个 Sora orphan × 每个 5min poll 把启动期
+        阻塞数十分钟。Dispatcher 不调 `_drain_finished_tasks`，完全依赖主循环每 cycle
+        清理 inflight 字典；`_stop_event` 触发时 dispatcher 自然退出。
         """
         orphans = await self.queue.list_orphan_tasks_on_start()
         if not orphans:
@@ -715,8 +761,26 @@ class GenerationWorker:
             self.lease_ttl,
         )
 
+        # self-active 防 self-preemption：lease flap > 3×TTL 后 _orphan_handled_once
+        # 重置，再扫 DB running 会包含本进程仍 inflight 的 task。若不排除：
+        # - image 任务 → 错误标 [restart_lost]（任务还在跑就被标失败）
+        # - video 任务 → 启动重复 resume 流，同一 provider job 被并发 poll/finalize，
+        #   崩溃窗口可能导致 provider 端双重扣费（违反 ADR 0007 红线）
+        # 收集本进程当前在跑的 task_id（image_inflight + video_inflight + video_pending），
+        # DB 扫到的同 id task 视为本进程的活，跳过孤儿处理。
+        self_active_task_ids: set[str] = set()
+        for pool in self._pools.values():
+            self_active_task_ids.update(pool.image_inflight.keys())
+            self_active_task_ids.update(pool.video_inflight.keys())
+            self_active_task_ids.update(pool.video_pending.keys())
+
+        resumable_by_provider: dict[str, list[dict[str, Any]]] = {}
+
         for task in orphans:
             task_id = task["task_id"]
+            if task_id in self_active_task_ids:
+                logger.info("孤儿扫到本进程仍 active 的 task %s，跳过避免 self-preemption", task_id)
+                continue
             status = task.get("status")
             if status == "cancelling":
                 await self.queue.mark_task_cancelled(task_id, cancelled_by="user")
@@ -771,11 +835,146 @@ class GenerationWorker:
                     await self.queue.mark_task_cancelled(task_id, cancelled_by="user")
                 continue
 
-            # 把 resume task 插入对应 pool inflight，让 cancel running 也能命中
-            pool = self._get_or_create_pool(provider_id)
-            inflight = pool.video_inflight if media_type == "video" else pool.image_inflight
-            inflight[task_id] = asyncio.create_task(
-                self._process_resume_task(task),
-                name=f"resume-{media_type}-{task_id}",
+            # 收集到 provider 桶，交给后台 dispatcher 受 pool 容量约束分批处理。
+            # 顺便把 resolve 出的 provider_id 写回 task dict，dispatcher 路由用。
+            task["provider_id"] = provider_id
+            resumable_by_provider.setdefault(provider_id, []).append(task)
+
+        if resumable_by_provider:
+            total = sum(len(v) for v in resumable_by_provider.values())
+            logger.info(
+                "孤儿扫描 fast path 完成：%d 个可 resume video 任务交后台分批 dispatch",
+                total,
             )
-        logger.info("孤儿扫描完成，已派发 resume 任务")
+            # lease 重夺时旧 dispatcher 可能还在跑（典型场景：resume_video 内 poll provider
+            # 需要几分钟到 10+ 分钟）。本轮**不 await 不 cancel** 直接覆盖句柄：
+            # - 不 await：避免阻塞主循环 → liveness 问题（无法续 lease 心跳/无法响应 cancel API）
+            # - 不 cancel：cancel 会让旧 dispatcher 的 _run_one 抛 CancelledError，进入
+            #   兜底 mark_task_cancelled 路径，把用户**未主动取消**的 in-flight resume 错误
+            #   标为 cancelled，且让 provider 端已扣费 job 失去归属
+            # - 直接覆盖：旧 dispatcher_task 的 sub-task 仍由 pool.video_pending/video_inflight
+            #   持有引用 + asyncio.gather 内部 callback 链持有，旧 task 不会被 GC detached
+            # - shutdown 仍能感知：_wait_inflight_completion 经 pool.all_active() 等到旧 sub-task
+            if self._orphan_dispatcher_task is not None and not self._orphan_dispatcher_task.done():
+                logger.warning(
+                    "旧 orphan dispatcher 仍在运行，本轮直接覆盖句柄不等待——"
+                    "旧 sub-task 由 pool 跟踪，shutdown 时经 pool.all_active 兜底"
+                )
+            self._orphan_dispatcher_task = asyncio.create_task(
+                self._dispatch_resume_orphans_background(resumable_by_provider),
+                name="orphan-dispatcher",
+            )
+        else:
+            logger.info("孤儿扫描完成，无可 resume 任务")
+
+    async def _dispatch_resume_orphans_background(
+        self,
+        resumable_by_provider: dict[str, list[dict[str, Any]]],
+    ) -> None:
+        """后台 dispatcher：按 provider 分桶并发，受 pool video_max 容量约束分批入 inflight。
+
+        - 不同 provider 之间无容量耦合 → 并发跑独立 sub-task；
+        - 同 provider 内顺序入队：满则 `asyncio.wait(inflight, FIRST_COMPLETED)` 等任一
+          完成（精确感知，不 sleep 轮询）；
+        - 主循环每 cycle 调 `_drain_finished_tasks` 自动 pop 已 done 的 task → dispatcher
+          下次 has_room 判定就有空位（解耦关键假设）；
+        - `_stop_event` 触发时 dispatcher 自然退出，不持有 lease 资源。
+        """
+        if self._stop_event.is_set():
+            return
+        sub_tasks = [
+            asyncio.create_task(
+                self._dispatch_provider_bucket(provider_id, tasks),
+                name=f"orphan-dispatch-{provider_id}",
+            )
+            for provider_id, tasks in resumable_by_provider.items()
+        ]
+        await asyncio.gather(*sub_tasks, return_exceptions=True)
+        logger.info("孤儿后台 dispatcher 完成")
+
+    async def _dispatch_provider_bucket(
+        self,
+        provider_id: str,
+        tasks: list[dict[str, Any]],
+    ) -> None:
+        """同 provider 桶并发跑 resume task，pending/inflight 分集合精确容量与 cancel 跟踪。
+
+        - ``pool.video_max <= 0``：fail-fast mark_failed[resume_unsupported]，不进
+          ``Semaphore(0)`` 死锁；reload 一次兜底，避免启动期 capability 抖动误判。
+        - sub-task 由父协程同步预先注册到 ``pool.video_pending``——避免 ``create_task``
+          异步调度还未触发时主循环 ``has_video_room`` 看 inflight={} 误判可有容量。
+        - sem acquire 成功后从 pending 移到 inflight；finally 两个 dict 都 pop。
+        - sem 闭包旧 pool 限制：本 sem = Semaphore(pool.video_max) 在 dispatch 顶部
+          捕获 pool 时定型；reload 期间替换的新 pool 不会影响 sem。这是本批 dispatch
+          内并发上限维持 reload 前值的已知设计选择，非 bug。
+        """
+        pool = self._get_or_create_pool(provider_id)
+        if pool.video_max <= 0:
+            # 启动期 reload 兜底：DB 加载可能晚于第一次 orphan 扫描。
+            try:
+                await self.reload_limits()
+            except Exception:
+                logger.warning("reload_limits 兜底失败", exc_info=True)
+            pool = self._get_or_create_pool(provider_id)
+        if pool.video_max <= 0:
+            for t in tasks:
+                rows = await self.queue.mark_task_failed(
+                    t["task_id"],
+                    f"[resume_unsupported] provider {provider_id} video_max=0",
+                )
+                if rows == 0:
+                    await self.queue.mark_task_cancelled(t["task_id"], cancelled_by="user")
+            return
+
+        sem = asyncio.Semaphore(pool.video_max)
+
+        async def _run_one(t: dict[str, Any]) -> None:
+            task_id = t["task_id"]
+            acquired = False
+            try:
+                await sem.acquire()
+                acquired = True
+                if self._stop_event.is_set():
+                    return
+                # acquire 后 pool 可能在 reload_limits 期间被换新引用；
+                # 务必从 self._pools 重读，保证 inflight 字典写入新 pool
+                pool_now = self._get_or_create_pool(provider_id)
+                pool_now.video_pending.pop(task_id, None)
+                current = asyncio.current_task()
+                if current is not None:
+                    pool_now.video_inflight[task_id] = current
+                logger.info("已派发 resume video orphan: task_id=%s provider=%s", task_id, provider_id)
+                await self._process_resume_task(t)
+            except asyncio.CancelledError:
+                # 三种 cancel 路径都在这里兜底 mark_task_cancelled——SQL WHERE
+                # status IN (queued, cancelling, running) 保证幂等：
+                # 1) sem.acquire 等待期 cancel → _process_resume_task 还没跑，必须由此落终态
+                # 2) acquired=True 后但 _process_resume_task 内 try 块外（如 _extract_provider
+                #    的 await）cancel → 内部 mark 路径不会触发，必须由此落终态（CR round 2 #6）
+                # 3) _process_resume_task 内部 cancel → 内部已 mark，此处再调 SQL 命中
+                #    cancelled 行返回 0 rows，无副作用
+                try:
+                    await asyncio.shield(self.queue.mark_task_cancelled(task_id, cancelled_by="user"))
+                except Exception:
+                    logger.exception("sem dispatch cancel 落终态失败 task_id=%s", task_id)
+                raise
+            finally:
+                if acquired:
+                    sem.release()
+                # 同样重读以应对 reload race
+                pool_now = self._get_or_create_pool(provider_id)
+                pool_now.video_pending.pop(task_id, None)
+                pool_now.video_inflight.pop(task_id, None)
+
+        sub: list[asyncio.Task] = []
+        for t in tasks:
+            if self._stop_event.is_set():
+                break
+            # 父协程同步：先 create_task、再立即写入 pending dict——避免「create_task
+            # 是异步调度，has_video_room 在调度未发生前看 inflight={} 误判可有容量」
+            # 的瞬时 race。
+            sub_task = asyncio.create_task(_run_one(t), name=f"resume-video-{t['task_id']}")
+            pool.video_pending[t["task_id"]] = sub_task
+            sub.append(sub_task)
+        if sub:
+            await asyncio.gather(*sub, return_exceptions=True)
