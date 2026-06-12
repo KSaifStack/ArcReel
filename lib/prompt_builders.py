@@ -12,6 +12,8 @@ WebUI（server/services/generation_tasks.py）和 Skill（agent_runtime_profile/
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 # ---------------------------------------------------------------------------
 # 内部常量：防崩 / 反向 / 布局 / 风格前缀
 # ---------------------------------------------------------------------------
@@ -32,9 +34,9 @@ _PRODUCT_LAYOUT = (
 _CHARACTER_GUARD = "四个面板中角色面部、发型、服装、配饰完全一致；五官对称、手指完整为五指、肢体比例协调。"
 _SCENE_GUARD = "空间透视正常，陈设固定，光影统一。"
 _PROP_GUARD = "外观结构完整，焦点清晰。"
-_PRODUCT_GUARD = (
-    "产品外观必须忠实于参考图中的真实产品：logo、文字、配色、材质、比例与结构不得改变或臆造；各视图为同一件产品。"
-)
+# 产品保真核心句：sheet 生成守卫与镜头注入指令共用，调优措辞只改这一处。
+_PRODUCT_FIDELITY_CORE = "logo、文字、配色、材质、比例与结构不得改变或臆造"
+_PRODUCT_GUARD = f"产品外观必须忠实于参考图中的真实产品：{_PRODUCT_FIDELITY_CORE}；各视图为同一件产品。"
 
 # 反向提示词：精简到核心 4 项，避免 CFG 权重稀释。
 _NEGATIVE_TAIL_ASSET = "画面避免：水印、多余文字、低分辨率、手指畸形。"
@@ -117,6 +119,33 @@ def build_product_prompt(name: str, description: str, style: str = "", style_des
 # ---------------------------------------------------------------------------
 # 分镜 / 视频 prompt 末尾增强
 # ---------------------------------------------------------------------------
+
+
+def append_product_fidelity_tail(prompt: str, product_names: Sequence[str] | None) -> str:
+    """给产品镜头的生成 prompt 追加高保真还原指令。
+
+    仅在产品参考图实际注入请求时调用（分镜图与视频两层共用同一份指令文本）——
+    指令指向"产品参考图"，参考缺席时追加只会误导模型。``product_names`` 为空
+    （含 None 脏数据）返回原 prompt；重复调用幂等。误传单个字符串按单产品名处理
+    （str 本身满足 Sequence[str]，按字符迭代会拼出逐字括注的畸形指令）。
+    """
+    if not product_names:
+        return prompt
+    if isinstance(product_names, str):
+        product_names = (product_names,)
+    names = "".join(f"「{name}」" for name in product_names if name)
+    if not names:
+        return prompt
+    tail = (
+        f"产品高保真还原（最高优先级）：画面中的产品{names}必须与产品参考图完全一致——"
+        f"{_PRODUCT_FIDELITY_CORE}，不得重新设计或美化产品本身；"
+        "项目画风只作用于产品以外的画面元素。"
+    )
+    if not prompt or not prompt.strip():
+        return tail
+    if tail in prompt:
+        return prompt
+    return f"{prompt.rstrip()}\n\n{tail}"
 
 
 def append_video_negative_tail(prompt: str) -> str:
