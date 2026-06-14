@@ -1,8 +1,10 @@
 /**
- * API 调用封装 (TypeScript)
+ * API Client Configuration (TypeScript)
  *
- * Typed API layer for all backend endpoints.
- * Import: import { API } from '@/api';
+ * This file serves as the typed API layer for all backend endpoints.
+ * It contains all the necessary API calls for project management, assets, video/image generation, and settings.
+ *
+ * Import example: `import { API } from '@/api';`
  */
 
 import type {

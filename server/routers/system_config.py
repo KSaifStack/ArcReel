@@ -203,6 +203,10 @@ class SystemConfigPatchRequest(BaseModel):
     text_backend_script: str | None = None
     text_backend_overview: str | None = None
     text_backend_style: str | None = None
+    # Per-task routing: asset extraction (route to cheaper/faster models)
+    text_backend_character_extraction: str | None = None
+    text_backend_scene_extraction: str | None = None
+    text_backend_prop_extraction: str | None = None
 
 
 # Setting keys that map directly to string DB settings
@@ -221,6 +225,10 @@ _STRING_SETTINGS = (
     "text_backend_script",
     "text_backend_overview",
     "text_backend_style",
+    # Per-task routing for asset extraction
+    "text_backend_character_extraction",
+    "text_backend_scene_extraction",
+    "text_backend_prop_extraction",
 )
 
 
@@ -281,6 +289,10 @@ async def get_system_config(
         "text_backend_script": all_s.get("text_backend_script") or "",
         "text_backend_overview": all_s.get("text_backend_overview") or "",
         "text_backend_style": all_s.get("text_backend_style") or "",
+        # Per-task routing for asset extraction
+        "text_backend_character_extraction": all_s.get("text_backend_character_extraction") or "",
+        "text_backend_scene_extraction": all_s.get("text_backend_scene_extraction") or "",
+        "text_backend_prop_extraction": all_s.get("text_backend_prop_extraction") or "",
     }
 
     options = await _build_options(svc, session)

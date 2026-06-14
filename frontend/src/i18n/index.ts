@@ -1,6 +1,5 @@
 import i18n from 'i18next';
 import { initReactI18next } from 'react-i18next';
-import LanguageDetector from 'i18next-browser-languagedetector';
 import resourcesToBackend from 'i18next-resources-to-backend';
 import { BRAND } from '@/branding';
 
@@ -63,9 +62,6 @@ export const i18nReady = i18n
     resourcesToBackend(async (lang: string, ns: string) => {
       const loader = loaders[pathFor(lang, ns)];
       if (!loader) {
-        // LanguageDetector 可能解析出 zh-CN / en-GB 等带区域的 BCP47 代码，
-        // i18next 会先按完整代码请求一次再 fallback 到 zh/en。这是预期路径，
-        // 不应该升级成异常。返回空对象让 i18next 走 fallback 链。
         console.warn(`i18n: no resource for ${pathFor(lang, ns)}, falling back`);
         return {};
       }
@@ -73,10 +69,10 @@ export const i18nReady = i18n
       return applyBrandPlaceholders(mod.default) as Record<string, string>;
     }),
   )
-  .use(LanguageDetector)
   .use(initReactI18next)
   .init({
-    fallbackLng: 'zh',
+    lng: 'en',
+    fallbackLng: 'en',
     supportedLngs: SUPPORTED_LANGUAGES,
     debug: false,
     interpolation: { escapeValue: false },

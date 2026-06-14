@@ -156,6 +156,10 @@ _TEXT_TASK_SETTING_KEYS: dict[TextTaskType, str] = {
     TextTaskType.SCRIPT: "text_backend_script",
     TextTaskType.OVERVIEW: "text_backend_overview",
     TextTaskType.STYLE_ANALYSIS: "text_backend_style",
+    # Asset extraction tasks — can be routed to cheaper/faster models
+    TextTaskType.CHARACTER_EXTRACTION: "text_backend_character_extraction",
+    TextTaskType.SCENE_EXTRACTION: "text_backend_scene_extraction",
+    TextTaskType.PROP_EXTRACTION: "text_backend_prop_extraction",
 }
 
 

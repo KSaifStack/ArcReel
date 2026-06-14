@@ -54,11 +54,15 @@ class TextCapability(StrEnum):
 
 
 class TextTaskType(StrEnum):
-    """文本生成任务类型。"""
+    """Text generation task types for per-task model routing."""
 
     SCRIPT = "script"
     OVERVIEW = "overview"
     STYLE_ANALYSIS = "style"
+    # Asset extraction tasks — routed to cheaper/faster models
+    CHARACTER_EXTRACTION = "character_extraction"
+    SCENE_EXTRACTION = "scene_extraction"
+    PROP_EXTRACTION = "prop_extraction"
 
 
 @dataclass

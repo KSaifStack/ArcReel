@@ -9,9 +9,6 @@ frontend/ (React SPA)  →  server/ (FastAPI)  →  lib/ (核心库)
   zustand 状态管理          (Claude Agent SDK)
 ```
 
-## 语言规范
-- **回答用户必须使用中文**：所有回复、任务清单及计划文件，均须使用中文
-
 ## 开发命令
 
 ```bash
